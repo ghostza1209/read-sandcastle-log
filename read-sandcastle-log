@@ -1,0 +1,420 @@
+#!/usr/bin/env node
+// Renders a raw .sandcastle/logs/*.log file as a condensed, human-readable summary:
+// a k9s-style header + run table up top, then per-run detail with tool calls laid
+// out as an aligned table. Collapses setup boilerplate and multi-line tool calls;
+// leaves the agent's own prose (reasoning, analysis, final report) untouched.
+//
+// Run in a real terminal: opens a full-screen TUI with one tab per *.log file in
+// the directory. Switching tabs shows that file's report immediately; the active
+// tab live-follows its file as Sandcastle appends to it (like `tail -f`),
+// auto-scrolling unless you scroll up to read back. Piped or redirected: prints
+// the report for a single resolved file as plain text once.
+import { readFileSync, readdirSync, statSync, existsSync, watch } from "node:fs";
+import { emitKeypressEvents } from "node:readline";
+import { join, basename, dirname } from "node:path";
+import { PassThrough } from "node:stream";
+
+const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+const codes = { bold: "1", dim: "2", red: "31", green: "32", yellow: "33", blue: "34", magenta: "35", cyan: "36", gray: "90" };
+const paint = (code) => (s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
+const color = Object.fromEntries(Object.entries(codes).map(([name, code]) => [name, paint(code)]));
+const inverse = (s) => (useColor ? `\x1b[7m${s}\x1b[27m` : `> ${s}`);
+
+const DEFAULT_DIR = ".sandcastle/logs";
+
+const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
+const padEnd = (s, width) => s + " ".repeat(Math.max(0, width - stripAnsi(s).length));
+
+// Clips a line to `width` visible columns, preserving ANSI codes. Report lines (log prose,
+// tool-call previews) can be far wider than the terminal — left unclipped, the terminal
+// auto-wraps them, which overflows the alt-screen buffer and scrolls the tab bar off the top.
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+function clipAnsi(s, width) {
+  if (width <= 0) return "";
+  if (stripAnsi(s).length <= width) return s;
+  let out = "";
+  let visible = 0;
+  let i = 0;
+  while (i < s.length && visible < width) {
+    ANSI_RE.lastIndex = i;
+    const m = ANSI_RE.exec(s);
+    if (m && m.index === i) {
+      out += m[0];
+      i = ANSI_RE.lastIndex;
+      continue;
+    }
+    out += s[i];
+    visible += 1;
+    i += 1;
+  }
+  return out + (useColor ? "\x1b[0m" : "");
+}
+
+const TOOL_OPENER = /^([A-Za-z][A-Za-z0-9_]*)\((.*)$/;
+const RUN_START = /^--- Run started: (.+) ---$/;
+const HARD_BOUNDARY = /^(--- Run started:|Agent started$|Agent stopped$|Run complete:|Reached max iterations|Capturing session$)/;
+const HEREDOC_START = /<<-?\s*'?"?(\w+)'?"?\s*$/;
+
+function collectToolCall(lines, startIndex) {
+  const opener = TOOL_OPENER.exec(lines[startIndex]);
+  const tool = opener[1];
+  let text = opener[2];
+  let i = startIndex;
+  // A tool-call line always ends with the ')' that closes "Tool(...)" — so once we're not
+  // sitting inside a heredoc body, a line ending in ')' closes the call. This is more robust
+  // than counting parens, which breaks on stray literal '(' in command text (e.g. a regex).
+  let heredocEnd = HEREDOC_START.exec(lines[startIndex])?.[1] ?? null;
+  while (i + 1 < lines.length && !HARD_BOUNDARY.test(lines[i + 1])) {
+    if (heredocEnd) {
+      if (lines[i + 1].trim() === heredocEnd) heredocEnd = null;
+      i += 1;
+      text += "\n" + lines[i];
+      continue;
+    }
+    if (text.trimEnd().endsWith(")")) break;
+    i += 1;
+    const line = lines[i];
+    text += "\n" + line;
+    heredocEnd = HEREDOC_START.exec(line)?.[1] ?? null;
+  }
+  if (text.trimEnd().endsWith(")")) text = text.trimEnd().slice(0, -1);
+  const firstLine = text.split("\n")[0].trim();
+  const extraLines = text.split("\n").length - 1;
+  const preview = firstLine.length > 130 ? firstLine.slice(0, 130) + "…" : firstLine;
+  return { tool, preview, extraLines, endIndex: i };
+}
+
+function collectBlock(lines, startIndex, doneRegex) {
+  let i = startIndex;
+  while (i + 1 < lines.length && !doneRegex.test(lines[i]) && !HARD_BOUNDARY.test(lines[i])) i += 1;
+  const doneMatch = doneRegex.exec(lines[i]);
+  return { endIndex: i, done: doneMatch ? doneMatch[0] : null };
+}
+
+function parseRuns(lines) {
+  const runs = [];
+  let run = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    const runStart = RUN_START.exec(line);
+    if (runStart) {
+      run = { startedAt: runStart[1], meta: {}, iteration: null, items: [], calls: 0, status: null, promiseComplete: false };
+      runs.push(run);
+      continue;
+    }
+    if (!run) continue;
+
+    if (line === "Sandcastle Run") continue;
+    const metaMatch = /^\s*(Agent|Sandbox|Max iterations|Branch): (.+)$/.exec(line);
+    if (metaMatch) {
+      run.meta[metaMatch[1]] = metaMatch[2];
+      continue;
+    }
+    const iterMatch = /^Iteration (\d+\/\d+)$/.exec(line);
+    if (iterMatch) {
+      run.iteration = iterMatch[1];
+      run.items.push({ kind: "rule" });
+      continue;
+    }
+    if (line === "Setting up sandbox") {
+      const { endIndex, done } = collectBlock(lines, i, /^Setting up sandbox done/);
+      run.items.push({ kind: "text", text: color.gray(`Setup: ${done ?? "sandbox ready"}`) });
+      i = endIndex;
+      continue;
+    }
+    if (line === "Expanding shell expressions") {
+      const { endIndex, done } = collectBlock(lines, i, /^Expanding shell expressions done/);
+      run.items.push({ kind: "text", text: color.gray(`Expanded shell expressions: ${done ?? "done"}`) });
+      i = endIndex;
+      continue;
+    }
+    if (line === "Agent started" || line === "Agent stopped") {
+      run.items.push({ kind: "text", text: color.magenta(`── ${line} ──`) });
+      continue;
+    }
+    if (line === "Capturing session" || line.startsWith("Collecting commits")) continue;
+    if (line.startsWith("Reached max iterations") || line.startsWith("Run complete:")) {
+      run.status = line;
+      run.items.push({ kind: "text", text: color.cyan(line) });
+      continue;
+    }
+    if (line.startsWith("Context window:")) {
+      run.items.push({ kind: "text", text: color.gray(line) });
+      continue;
+    }
+    if (line.includes("<promise>COMPLETE</promise>")) {
+      run.promiseComplete = true;
+      run.items.push({ kind: "text", text: color.bold(color.green("✅ Agent signaled COMPLETE")) });
+      continue;
+    }
+    if (/failed:/i.test(line) && !TOOL_OPENER.test(line)) {
+      run.items.push({ kind: "text", text: color.red(`⚠️  ${line}`) });
+      continue;
+    }
+
+    const opener = TOOL_OPENER.exec(line);
+    if (opener) {
+      run.calls += 1;
+      const { tool, preview, extraLines, endIndex } = collectToolCall(lines, i);
+      run.items.push({ kind: "call", n: run.calls, tool, preview, extraLines });
+      i = endIndex;
+      continue;
+    }
+
+    if (line.trim() === "") continue;
+    run.items.push({ kind: "text", text: line });
+  }
+
+  return runs;
+}
+
+function statusLabel(r) {
+  if (r.promiseComplete || r.status?.includes("agent finished")) return { text: "finished", c: color.green };
+  if (r.status?.includes("reached")) return { text: "reached max iter", c: color.yellow };
+  if (r.status) return { text: "stopped", c: color.yellow };
+  return { text: "no completion line", c: color.red };
+}
+
+function renderTable(headers, rows, aligns = []) {
+  const widths = headers.map((h, col) =>
+    Math.max(stripAnsi(h).length, ...rows.map((r) => stripAnsi(r[col] ?? "").length))
+  );
+  const line = (cells) =>
+    "  " + cells.map((c, col) => (aligns[col] === "right" ? c.padStart(widths[col]) : padEnd(c, widths[col]))).join("  ");
+  const out = [line(headers.map((h) => color.bold(color.cyan(h))))];
+  out.push("  " + color.gray("─".repeat(widths.reduce((a, w) => a + w, 0) + 2 * (widths.length - 1))));
+  for (const r of rows) out.push(line(r));
+  return out;
+}
+
+function renderReport(filePath) {
+  const lines = readFileSync(filePath, "utf8").split("\n");
+  const runs = parseRuns(lines);
+  const out = [];
+
+  out.push(color.bold(color.cyan("Sandcastle Run Log")));
+  out.push(color.gray(`File: ${filePath}`));
+
+  const counts = runs.reduce((acc, r) => {
+    acc[statusLabel(r).text] = (acc[statusLabel(r).text] ?? 0) + 1;
+    return acc;
+  }, {});
+  out.push(
+    `Runs: ${color.bold(String(runs.length))}  ` +
+      Object.entries(counts)
+        .map(([label, n]) => `${color.green("●")} ${n} ${label}`)
+        .join("   ")
+  );
+  out.push("");
+
+  out.push(
+    ...renderTable(
+      ["#", "STARTED", "AGENT", "ITER", "CALLS", "STATUS"],
+      runs.map((r, idx) => {
+        const s = statusLabel(r);
+        return [String(idx + 1), r.startedAt, r.meta.Agent ?? "-", r.iteration ?? "-", String(r.calls), s.c(s.text)];
+      }),
+      ["right", "left", "left", "right", "right", "left"]
+    )
+  );
+
+  for (const [idx, r] of runs.entries()) {
+    const meta = `${r.meta.Agent ?? "?"} · ${r.meta.Sandbox ?? "?"} · ${r.meta.Branch ?? "?"}`;
+    const title = ` RUN ${idx + 1}  ${r.startedAt}  (${meta}) `;
+    out.push("", color.cyan("─".repeat(title.length)), color.bold(color.cyan(title)), color.cyan("─".repeat(title.length)));
+
+    const calls = r.items.filter((it) => it.kind === "call");
+    const nWidth = String(calls.length).length;
+    const toolWidth = Math.max(0, ...calls.map((c) => c.tool.length));
+
+    for (const item of r.items) {
+      if (item.kind === "rule") continue;
+      if (item.kind === "text") {
+        out.push(item.text);
+        continue;
+      }
+      const suffix = item.extraLines > 0 ? color.gray(` (+${item.extraLines} more lines)`) : "";
+      const n = color.dim(String(item.n).padStart(nWidth) + ".");
+      const tool = color.yellow(item.tool.padEnd(toolWidth));
+      out.push(`  ${n} ${tool}  ${item.preview}${suffix}`);
+    }
+  }
+
+  return out;
+}
+
+// --- plain mode: not a real terminal (piped/redirected), print once and exit -------------
+
+function resolvePathPlain(arg) {
+  if (arg && existsSync(arg) && statSync(arg).isFile()) return arg;
+  const dir = arg && existsSync(arg) && statSync(arg).isDirectory() ? arg : DEFAULT_DIR;
+  const files = readdirSync(dir).filter((f) => f.endsWith(".log")).sort();
+  if (files.length === 0) {
+    console.error(`No .log files found in ${dir}`);
+    process.exit(1);
+  }
+  if (files.length > 1) {
+    console.error(`Multiple logs in ${dir}, pass one explicitly:\n` + files.map((f) => `  ${join(dir, f)}`).join("\n"));
+    process.exit(1);
+  }
+  return join(dir, files[0]);
+}
+
+// --- TUI mode --------------------------------------------------------------------------
+
+function enterAltScreen() {
+  process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
+}
+function exitAltScreen() {
+  process.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+}
+
+const SGR_MOUSE = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+
+// readline's keypress parser doesn't recognize SGR mouse sequences (\x1b[<0;5;1M) as a
+// single key — it falls through and emits each embedded character as its own bogus
+// keypress (e.g. "0", "5", "1"), which collide with the 1-9 tab-switch shortcut and fire
+// spurious tab switches + redraws (flicker) on every click. So mouse bytes are stripped
+// out of the raw stream and only the leftover bytes are fed to the keypress parser.
+function setupInput(onKey, onClick) {
+  const keyStream = new PassThrough();
+  emitKeypressEvents(keyStream);
+  keyStream.on("keypress", onKey);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+  const onData = (buf) => {
+    const text = buf.toString("latin1");
+    let rest = "";
+    let lastIndex = 0;
+    for (const m of text.matchAll(SGR_MOUSE)) {
+      rest += text.slice(lastIndex, m.index);
+      lastIndex = m.index + m[0].length;
+      const [, button, col, row, type] = m;
+      if (type === "M" && button === "0") onClick(Number(col), Number(row)); // left-click press only
+    }
+    rest += text.slice(lastIndex);
+    if (rest) keyStream.write(Buffer.from(rest, "latin1"));
+  };
+  process.stdin.on("data", onData);
+
+  return () => {
+    process.stdin.off("data", onData);
+    keyStream.removeAllListeners();
+    try {
+      process.stdin.setRawMode(false);
+    } catch {}
+  };
+}
+
+function resolveTabFiles(arg) {
+  const isFile = arg && existsSync(arg) && statSync(arg).isFile();
+  const dir = isFile ? dirname(arg) : arg && existsSync(arg) && statSync(arg).isDirectory() ? arg : DEFAULT_DIR;
+  const files = readdirSync(dir).filter((f) => f.endsWith(".log")).sort().map((f) => join(dir, f));
+  if (files.length === 0) {
+    console.error(`No .log files found in ${dir}`);
+    process.exit(1);
+  }
+  const initial = isFile ? Math.max(0, files.indexOf(arg)) : 0;
+  return { files, initial };
+}
+
+function runTui(initialArg) {
+  const { files, initial } = resolveTabFiles(initialArg);
+  const tabs = files.map((filePath) => ({ filePath, reportLines: renderReport(filePath), scroll: 0, follow: true }));
+  let active = initial;
+  let watcher = null;
+  let debounce = null;
+
+  const viewportHeight = () => Math.max(1, (process.stdout.rows || 24) - 2);
+  let tabBoundaries = []; // [startCol, endCol] per tab, 1-indexed, for mouse hit-testing
+
+  function draw() {
+    const tab = tabs[active];
+    const h = viewportHeight();
+    const maxScroll = Math.max(0, tab.reportLines.length - h);
+    if (tab.follow) tab.scroll = maxScroll;
+    tab.scroll = Math.min(Math.max(0, tab.scroll), maxScroll);
+    const view = tab.reportLines.slice(tab.scroll, tab.scroll + h);
+
+    let col = 1;
+    tabBoundaries = [];
+    const tabBar = tabs
+      .map((t, i) => {
+        const label = ` ${i + 1}:${basename(t.filePath)} `;
+        tabBoundaries.push([col, col + label.length - 1]);
+        col += label.length;
+        return i === active ? color.bold(inverse(label)) : color.gray(label);
+      })
+      .join("");
+    const status = `[${tab.scroll + 1}-${Math.min(tab.scroll + h, tab.reportLines.length)}/${tab.reportLines.length}]  ${
+      tab.follow ? "FOLLOWING" : "PAUSED"
+    }  click or Tab/1-9 switch tab · ↑/↓ scroll · g/G top/bottom · q quit`;
+
+    // Cursor-home + per-line clear-to-eol instead of a full \x1b[2J clear before every
+    // redraw: a full clear blanks the screen for a frame, which flickers badly when the
+    // active tab's file is being written to often (e.g. a live agent run tailing fast).
+    const cols = process.stdout.columns || 80;
+    const frameLines = [tabBar, ...view, inverse(padEnd(status, cols))].map((l) => clipAnsi(l, cols));
+    process.stdout.write("\x1b[H" + frameLines.map((l) => l + "\x1b[K").join("\n") + "\x1b[J");
+  }
+
+  function watchActive() {
+    if (watcher) watcher.close();
+    watcher = watch(tabs[active].filePath, { persistent: true }, () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        tabs[active].reportLines = renderReport(tabs[active].filePath);
+        draw();
+      }, 200);
+    });
+  }
+
+  function switchTo(idx) {
+    active = ((idx % tabs.length) + tabs.length) % tabs.length;
+    tabs[active].reportLines = renderReport(tabs[active].filePath);
+    watchActive();
+    draw();
+  }
+
+  enterAltScreen();
+  process.on("exit", exitAltScreen);
+  watchActive();
+
+  const onKey = (str, key) => {
+    const tab = tabs[active];
+    const h = viewportHeight();
+    if (key.name === "tab" && key.shift) switchTo(active - 1);
+    else if (key.name === "tab") switchTo(active + 1);
+    else if (str && /^[1-9]$/.test(str) && Number(str) <= tabs.length) switchTo(Number(str) - 1);
+    else if (key.name === "up" || key.name === "k") {
+      tab.follow = false;
+      tab.scroll -= 1;
+    } else if (key.name === "down" || key.name === "j") tab.scroll += 1;
+    else if (key.name === "pageup") {
+      tab.follow = false;
+      tab.scroll -= h;
+    } else if (key.name === "pagedown") tab.scroll += h;
+    else if (str === "g") {
+      tab.follow = false;
+      tab.scroll = 0;
+    } else if (str === "G") tab.follow = true;
+    else if (str === "q" || (key.ctrl && key.name === "c")) process.exit(0);
+    draw();
+  };
+  setupInput(onKey, (col, row) => {
+    if (row !== 1) return; // tab bar is the top row
+    const idx = tabBoundaries.findIndex(([start, end]) => col >= start && col <= end);
+    if (idx !== -1) switchTo(idx);
+  });
+  process.stdout.on("resize", draw);
+  draw();
+}
+
+const arg = process.argv[2];
+if (process.stdout.isTTY && process.stdin.isTTY) {
+  runTui(arg);
+} else {
+  console.log(renderReport(resolvePathPlain(arg)).join("\n"));
+}
